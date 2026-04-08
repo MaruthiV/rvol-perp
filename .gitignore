@@ -1,0 +1,33 @@
+CLAUDE.md
+
+# Data (large files, never commit)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Parquet / data files
+*.parquet
+*.parquet.gz
+*.csv.gz
+
+# Env
+.env
+.env.*
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/

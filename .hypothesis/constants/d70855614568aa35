@@ -1,0 +1,4 @@
+# file: /Users/maruthi/Documents/dev/rvol-perp/rvol/index/variance.py
+# hypothesis_version: 6.151.12
+
+[0.0, 1000, 'is_valid', 'n_capped', 'n_obs', 'rv', 'rv_annualized']

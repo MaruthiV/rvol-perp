@@ -1,0 +1,4 @@
+# file: /Users/maruthi/Documents/dev/rvol-perp/rvol/index/returns.py
+# hypothesis_version: 6.151.12
+
+[1.5, 1000, '1min', 'is_gap', 'log_return', 'n_trades', 'price', 'size', 'timestamp_us', 'us', 'volume', 'vwap']

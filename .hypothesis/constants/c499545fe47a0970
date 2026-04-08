@@ -1,0 +1,4 @@
+# file: /Users/maruthi/Documents/dev/rvol-perp/rvol/pipeline/storage.py
+# hypothesis_version: 6.151.12
+
+['*.parquet', '-', 'close', 'dvol_annualized', 'funding_rate', 'high', 'is_capped', 'is_gap', 'is_valid', 'log_return', 'low', 'n_capped', 'n_obs', 'n_trades', 'open', 'price', 'quote_volume', 'rv14', 'rv30', 'rv7', 'side', 'size', 'snappy', 'timestamp_us', 'volume']
