@@ -1,5 +1,13 @@
 """Download Binance BTCUSDT perpetual 1m klines and 8h funding rates.
 
+Uses data.binance.vision — Binance's public bulk data portal.
+No API key required. No geo-restrictions. Bulk zip downloads, much faster
+than the REST API.
+
+URL patterns:
+  Klines:       https://data.binance.vision/data/futures/um/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{YYYY-MM}.zip
+  Funding:      https://data.binance.vision/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{YYYY-MM}.zip
+
 Usage:
     python scripts/fetch_binance.py                          # klines + funding
     python scripts/fetch_binance.py --klines-only
@@ -13,7 +21,9 @@ Output:
 """
 
 import argparse
+import io
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +31,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import requests
 from tqdm import tqdm
 
 from rvol.pipeline.storage import FUNDING_SCHEMA, OHLCV_SCHEMA, write_parquet
@@ -28,165 +39,150 @@ from rvol.pipeline.storage import FUNDING_SCHEMA, OHLCV_SCHEMA, write_parquet
 DATA_DIR = Path(__file__).parent.parent / "data" / "raw" / "binance"
 DEFAULT_START = "2020-01-01"
 DEFAULT_SYMBOL = "BTCUSDT"
-KLINE_INTERVAL = "1m"
-KLINE_LIMIT = 1500  # Binance max per request
+
+BASE_URL = "https://data.binance.vision/data/futures/um/monthly"
+
+KLINE_COLS = [
+    "timestamp_us", "open", "high", "low", "close",
+    "volume", "close_time_ms", "quote_volume", "n_trades",
+    "taker_buy_volume", "taker_buy_quote_volume", "ignore",
+]
+
+FUNDING_COLS = ["calc_time_ms", "funding_interval_hours", "last_funding_rate"]
+
+
+def _month_range(start: str, end: str | None = None) -> list[str]:
+    """Return list of YYYY-MM strings from start to end (inclusive)."""
+    start_dt = datetime.strptime(start[:7], "%Y-%m").replace(tzinfo=timezone.utc)
+    end_dt = datetime.now(timezone.utc) if end is None else \
+        datetime.strptime(end[:7], "%Y-%m").replace(tzinfo=timezone.utc)
+
+    months = []
+    cur = start_dt
+    while cur <= end_dt:
+        months.append(cur.strftime("%Y-%m"))
+        cur = cur.replace(month=cur.month % 12 + 1, year=cur.year + (1 if cur.month == 12 else 0))
+    return months
+
+
+def _download_zip(url: str) -> bytes | None:
+    """Download a zip file, return raw bytes or None on 404."""
+    try:
+        resp = requests.get(url, timeout=60)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.content
+    except requests.RequestException as e:
+        print(f"\n  Download failed ({url}): {e}")
+        return None
 
 
 def fetch_klines(symbol: str, start: str, end: str | None = None) -> None:
-    """Download 1-minute OHLCV klines and write to monthly partitioned parquet."""
-    from binance.client import Client
-
-    client = Client()
+    """Download 1-minute OHLCV klines from data.binance.vision."""
     symbol_dir = DATA_DIR / symbol.lower() / "klines_1m"
+    months = _month_range(start, end)
 
-    start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end_dt = datetime.now(timezone.utc) if end is None else datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    print(f"Fetching {symbol} 1m klines: {months[0]} → {months[-1]} ({len(months)} months)")
 
-    print(f"Fetching {symbol} 1m klines from {start_dt.date()} to {end_dt.date()}")
+    for ym in tqdm(months, desc="months"):
+        out_path = symbol_dir / ym / "klines.parquet"
+        if out_path.exists():
+            continue
 
-    start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(end_dt.timestamp() * 1000)
+        url = f"{BASE_URL}/klines/{symbol}/1m/{symbol}-1m-{ym}.zip"
+        raw = _download_zip(url)
+        if raw is None:
+            # Month not yet available (current month)
+            continue
 
-    all_rows: list[dict] = []
-    current_ms = start_ms
-    current_month: str | None = None
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            csv_name = zf.namelist()[0]
+            with zf.open(csv_name) as f:
+                raw_df = pd.read_csv(f, header=None, names=KLINE_COLS)
+            # data.binance.vision CSVs sometimes include a header row — drop it
+            df = raw_df[raw_df.iloc[:, 0].astype(str).str.match(r"^\d+$")].copy()
 
-    with tqdm(total=int((end_ms - start_ms) / (60 * 1000)), unit="min", desc="klines") as pbar:
-        while current_ms < end_ms:
-            try:
-                klines = client.get_historical_klines(
-                    symbol,
-                    KLINE_INTERVAL,
-                    start_str=current_ms,
-                    end_str=end_ms,
-                    limit=KLINE_LIMIT,
-                )
-            except Exception as e:
-                print(f"\nError fetching klines at {current_ms}: {e}. Retrying in 5s...")
-                time.sleep(5)
-                continue
+        # timestamp in ms → us
+        df["timestamp_us"] = df["timestamp_us"].astype(np.int64) * 1000
+        df["n_trades"] = df["n_trades"].astype(np.int32)
+        for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+            df[col] = df[col].astype(np.float64)
 
-            if not klines:
-                break
-
-            for k in klines:
-                row = {
-                    "timestamp_us": int(k[0]) * 1000,  # ms → us
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                    "quote_volume": float(k[7]),
-                    "n_trades": int(k[8]),
-                }
-                all_rows.append(row)
-
-            last_ts_ms = klines[-1][0]
-            pbar.update(len(klines))
-            current_ms = last_ts_ms + 60_000  # advance by 1 minute
-
-            # Flush monthly partition when month changes
-            month = datetime.fromtimestamp(last_ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m")
-            if current_month is None:
-                current_month = month
-            if month != current_month:
-                _flush_klines(all_rows, symbol_dir, current_month)
-                all_rows = []
-                current_month = month
-
-            # Rate limit: 1200 weight per minute; each klines request = 2 weight
-            time.sleep(0.15)
-
-    # Flush remaining
-    if all_rows and current_month:
-        _flush_klines(all_rows, symbol_dir, current_month)
+        table = pa.Table.from_pandas(
+            df[["timestamp_us", "open", "high", "low", "close", "volume", "quote_volume", "n_trades"]],
+            schema=OHLCV_SCHEMA,
+            preserve_index=False,
+        )
+        write_parquet(table, out_path, schema=OHLCV_SCHEMA)
+        time.sleep(0.1)
 
     _validate_klines_gaps(symbol_dir)
     print(f"Klines done → {symbol_dir}")
 
 
-def _flush_klines(rows: list[dict], base_dir: Path, month: str) -> None:
-    if not rows:
-        return
-    df = pd.DataFrame(rows)
-    table = pa.Table.from_pandas(df, schema=OHLCV_SCHEMA, preserve_index=False)
-    path = base_dir / month / "klines.parquet"
-    write_parquet(table, path, schema=OHLCV_SCHEMA)
-
-
 def _validate_klines_gaps(base_dir: Path) -> None:
-    """Print gap summary: any interval > 65s is flagged."""
+    """Print gap summary: any interval > 65s in the full timestamp sequence."""
     all_ts = []
-    for parquet_file in sorted(base_dir.rglob("*.parquet")):
-        tbl = pq.read_table(parquet_file, columns=["timestamp_us"])
+    for pf in sorted(base_dir.rglob("*.parquet")):
+        tbl = pq.read_table(pf, columns=["timestamp_us"])
         all_ts.extend(tbl.column("timestamp_us").to_pylist())
 
     if not all_ts:
         return
 
-    all_ts = sorted(set(all_ts))
-    ts_arr = np.array(all_ts, dtype=np.int64)
+    ts_arr = np.array(sorted(set(all_ts)), dtype=np.int64)
     diffs_us = np.diff(ts_arr)
-    gap_mask = diffs_us > 65_000_000  # 65s in us
+    gap_mask = diffs_us > 65_000_000  # 65s in microseconds
     n_gaps = int(gap_mask.sum())
     total = len(diffs_us)
-    print(f"Gap summary: {n_gaps}/{total} intervals > 65s ({n_gaps / total * 100:.3f}%)")
-    if n_gaps > 0 and n_gaps / total > 0.001:
+    pct = n_gaps / total * 100
+    print(f"Gap summary: {n_gaps}/{total} intervals > 65s ({pct:.4f}%)")
+    if pct > 0.1:
         print("  WARNING: gap rate > 0.1% — check data quality")
 
 
-def fetch_funding_rates(symbol: str) -> None:
-    """Download 8h perpetual funding rates."""
-    from binance.client import Client
-
-    client = Client()
+def fetch_funding_rates(symbol: str, start: str = DEFAULT_START, end: str | None = None) -> None:
+    """Download 8h funding rates from data.binance.vision."""
     symbol_dir = DATA_DIR / symbol.lower() / "funding_rates"
-    symbol_dir.mkdir(parents=True, exist_ok=True)
+    months = _month_range(start, end)
 
-    print(f"Fetching {symbol} funding rates...")
-    all_rates = []
-    end_time = None
+    print(f"Fetching {symbol} funding rates: {months[0]} → {months[-1]}")
 
-    while True:
-        try:
-            kwargs: dict = {"symbol": symbol, "limit": 1000}
-            if end_time is not None:
-                kwargs["endTime"] = end_time
-            rates = client.get_funding_rate(**kwargs)
-        except Exception as e:
-            print(f"Error fetching funding rates: {e}")
-            break
+    all_rows: list[dict] = []
+    for ym in tqdm(months, desc="funding"):
+        url = f"{BASE_URL}/fundingRate/{symbol}/{symbol}-fundingRate-{ym}.zip"
+        raw = _download_zip(url)
+        if raw is None:
+            continue
 
-        if not rates:
-            break
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            csv_name = zf.namelist()[0]
+            with zf.open(csv_name) as f:
+                raw_df = pd.read_csv(f, header=None, names=FUNDING_COLS)
+            df = raw_df[raw_df.iloc[:, 0].astype(str).str.match(r"^\d+$")].copy()
 
-        for r in rates:
-            all_rates.append({
-                "timestamp_us": int(r["fundingTime"]) * 1000,
-                "funding_rate": float(r["fundingRate"]),
+        for _, row in df.iterrows():
+            all_rows.append({
+                "timestamp_us": int(row["calc_time_ms"]) * 1000,
+                "funding_rate": float(row["last_funding_rate"]),
             })
+        time.sleep(0.1)
 
-        oldest_ts = rates[0]["fundingTime"]
-        end_time = oldest_ts - 1
-        time.sleep(0.2)
-
-        if len(rates) < 1000:
-            break
-
-    if not all_rates:
+    if not all_rows:
         print("No funding rate data retrieved.")
         return
 
-    df = pd.DataFrame(sorted(all_rates, key=lambda x: x["timestamp_us"]))
-    table = pa.Table.from_pandas(df, schema=FUNDING_SCHEMA, preserve_index=False)
-    path = symbol_dir / "funding.parquet"
-    write_parquet(table, path, schema=FUNDING_SCHEMA)
-    print(f"Funding rates done → {path} ({len(all_rates)} rows)")
+    result_df = pd.DataFrame(sorted(all_rows, key=lambda x: x["timestamp_us"]))
+    result_df = result_df.drop_duplicates(subset=["timestamp_us"])
+    table = pa.Table.from_pandas(result_df, schema=FUNDING_SCHEMA, preserve_index=False)
+    out_path = symbol_dir / "funding.parquet"
+    write_parquet(table, out_path, schema=FUNDING_SCHEMA)
+    print(f"Funding rates done → {out_path} ({len(result_df)} rows)")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch Binance perpetual data")
+    parser = argparse.ArgumentParser(description="Fetch Binance perpetual data (via data.binance.vision)")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--start", default=DEFAULT_START, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
@@ -197,7 +193,7 @@ def main() -> None:
     if not args.funding_only:
         fetch_klines(args.symbol, args.start, args.end)
     if not args.klines_only:
-        fetch_funding_rates(args.symbol)
+        fetch_funding_rates(args.symbol, args.start, args.end)
 
 
 if __name__ == "__main__":
