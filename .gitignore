@@ -1,5 +1,8 @@
 CLAUDE.md
 
+# Design docs (internal, not public)
+docs/design/
+
 # Data (large files, never commit)
 data/
 
